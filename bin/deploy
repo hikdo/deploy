@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 
 #
-# deploy(1) - Minimalistic shell script to deploy Git repositories.
-# Released under the MIT License.
-#
-# https://github.com/visionmedia/deploy
+# deployer
+# @look released under the MIT License.
 #
 
-VERSION="0.6.0"
-CONFIG=./deploy.conf
-LOG=/tmp/deploy.log
-TEST=1
 REF=
 ENV=
+TEST=1
+PWD=$(pwd)
+VERSION="1.0.0"
+CONFIG=$PWD/deploy.ini
+LOG=/tmp/deploy.log
+DEPLOYPATH=~/deploy/${PWD##*/}
 
 #
 # Output usage information.
@@ -26,21 +26,18 @@ usage() {
   Options:
 
     -C, --chdir <path>   change the working directory to <path>
-    -c, --config <path>  set config path. defaults to ./deploy.conf
+    -c, --config <path>  set config path. defaults to ./deploy.ini
     -T, --no-tests       ignore test hook
-    -V, --version        output program version
+    -v, --version        output program version
     -h, --help           output help information
 
   Commands:
 
     setup                run remote setup commands
-    update               update deploy to the latest release
     revert [n]           revert to [n]th last deployment or 1
     config [key]         output config file or [key]
     curr[ent]            output current release commit
     prev[ious]           output previous release commit
-    exec|run <cmd>       execute the given <cmd>
-    console              open an ssh session to the host
     list                 list previous deploy commits
     [ref]                deploy to [ref], the 'ref' setting, or latest tag
 
@@ -111,15 +108,11 @@ version() {
 ssh_command() {
   local url="`config_get user`@`config_get host`"
   local key="`config_get key`"
-  local forward_agent="`config_get forward-agent`"
   local port="`config_get port`"
-  local needs_tty="`config_get needs_tty`"
 
-  test -n "$forward_agent" && local agent="-A"
   test -n "$key" && local identity="-i $key"
   test -n "$port" && local port="-p $port"
-  test -n "$needs_tty" && local tty="-t"
-  echo "ssh $tty $agent $port $identity $url"
+  echo "ssh $port $identity $url"
 }
 
 #
@@ -137,7 +130,7 @@ run() {
 #
 
 console() {
-  local path="`config_get path`/current"
+  local path=`config_get path`
   local shell="`ssh_command`"
   echo $shell
   exec $shell -t "cd $path; \$SHELL --login"
@@ -166,8 +159,7 @@ hook() {
   local cmd=`config_get $hook`
   if test -n "$cmd"; then
     log "executing $hook \`$cmd\`"
-    run "cd $path/current; \
-      SHARED=\"$path/shared\" \
+    run "cd $path; \
       $cmd 2>&1 | tee -a $LOG; \
       exit \${PIPESTATUS[0]}"
     test $? -eq 0
@@ -181,15 +173,16 @@ hook() {
 #
 
 setup() {
-  local path=`config_get path`
+  local path=$DEPLOYPATH
   local repo=`config_get repo`
-  run "mkdir -p $path/{shared/{logs,pids},source}"
+  mkdir -p $path/{shared/{logs,pids},source}
   test $? -eq 0 || abort setup paths failed
   log running setup
   log cloning $repo
-  run "git clone $repo $path/source"
+  git clone $repo $path/source
+  git submodule update --init --recursive
   test $? -eq 0 || abort failed to clone
-  run "ln -sfn $path/source $path/current"
+  ln -sfn $path/source $path/current
   test $? -eq 0 || abort symlink failed
   log setup complete
 }
@@ -200,43 +193,42 @@ setup() {
 
 deploy() {
   local ref=$1
-  local path=`config_get path`
+  local path=$DEPLOYPATH
   log deploying
 
   hook pre-deploy || abort pre-deploy hook failed
 
   # fetch source
   log fetching updates
-  run "cd $path/source && git fetch --all"
+  cd $path/source && git fetch --all
   test $? -eq 0 || abort fetch failed
 
   # latest tag
   if test -z "$ref"; then
     log fetching latest tag
-    ref=`run "cd $path/source && git for-each-ref refs/tags \
+    ref=`cd $path/source && git for-each-ref refs/tags \
       --sort=-*authordate \
       --format='%(refname)' \
-      --count=1 | cut -d '/' -f 3"`
+      --count=1 | cut -d '/' -f 3`
     test $? -eq 0 || abort failed to determine latest tag
   fi
 
   # reset HEAD
   log resetting HEAD to $ref
-  run "cd $path/source && git reset --hard $ref"
+  cd $path/source && git reset --hard $ref
   test $? -eq 0 || abort git reset failed
+  git submodule update --init --recursive
 
   # link current
-  run "ln -sfn $path/source $path/current"
+  ln -sfn $path/source $path/current
   test $? -eq 0 || abort symlink failed
 
   # deploy log
-  run "cd $path/source && \
-      echo \`git rev-parse --short HEAD\` \
-      >> $path/.deploys"
+  cd $path/source
+  git rev-parse --short HEAD >> $path/.deploys
   test $? -eq 0 || abort deploy log append failed
 
-  hook post-deploy || abort post-deploy hook failed
-
+  # run test
   if test $TEST -eq 1; then
     hook test
     if test $? -ne 0; then
@@ -247,6 +239,18 @@ deploy() {
     log ignoring tests
   fi
 
+  # rsync
+  local shell="`ssh_command`"
+  local port=`config_get port`
+  local excludes=`config_get excludes`
+  local src=$path/source
+  local remote=`config_get user`@`config_get host`:`config_get path`
+
+  rsync -rltgoDzvO $src -e "ssh -p $port" --delete --progress --exclude ".git" $remote
+
+  # run hook
+  hook post-deploy || abort post-deploy hook failed
+
   # done
   log successfully deployed $ref
 }
@@ -256,9 +260,9 @@ deploy() {
 #
 
 current_commit() {
-  local path=`config_get path`
-  run "cd $path/source && \
-      git rev-parse --short HEAD"
+  local path=$DEPLOYPATH
+  cd $path/source && \
+      git rev-parse --short HEAD
 }
 
 #
@@ -267,8 +271,8 @@ current_commit() {
 
 nth_deploy_commit() {
   local n=$1
-  local path=`config_get path`
-  run "cat $path/.deploys | tail -n $n | head -n 1 | cut -d ' ' -f 1"
+  local path=$DEPLOYPATH
+  cat $path/.deploys | tail -n $n | head -n 1 | cut -d ' ' -f 1
 }
 
 #
@@ -276,8 +280,8 @@ nth_deploy_commit() {
 #
 
 list_deploys() {
-  local path=`config_get path`
-  run "cat $path/.deploys"
+  local path=$DEPLOYPATH
+  cat $path/.deploys
 }
 
 #
@@ -316,26 +320,12 @@ require_env() {
 #
 
 check_for_local_changes() {
+  cd "$DEPLOYPATH/source"
   git --no-pager diff --exit-code --quiet          || abort "commit or stash your changes before deploying"
   git --no-pager diff --exit-code --quiet --cached || abort "commit your staged changes before deploying"
   [ -z "`git rev-list @{upstream}.. -n 1`" ]       || abort "push your changes before deploying"
 }
 
-#
-# Update deploy.
-#
-
-update() {
-  log "updating deploy(1)"
-  rm -fr /tmp/deploy
-  git clone git://github.com/visionmedia/deploy.git \
-    --depth 0 \
-    /tmp/deploy \
-    &> /tmp/deploy.log \
-  && cd /tmp/deploy \
-  && make install \
-  && log "updated $VERSION -> `./bin/deploy --version`"
-}
 
 # parse argv
 
@@ -343,18 +333,15 @@ while test $# -ne 0; do
   arg=$1; shift
   case $arg in
     -h|--help) usage; exit ;;
-    -V|--version) version; exit ;;
+    -v|--version) version; exit ;;
     -c|--config) set_config_path $1; shift ;;
     -C|--chdir) log cd $1; cd $1; shift ;;
     -T|--no-tests) TEST=0 ;;
-    run|exec) require_env; run "cd `config_get path`/current && $@"; exit ;;
-    console) require_env; console; exit ;;
     curr|current) require_env; current_commit; exit ;;
     prev|previous) require_env; nth_deploy_commit 2; exit ;;
     revert) require_env; revert_to ${1-1}; exit ;;
     setup) require_env; setup $@; exit ;;
     list) require_env; list_deploys; exit ;;
-    update) update; exit ;;
     config) config $@; exit ;;
     *)
       if test -z "$ENV"; then
