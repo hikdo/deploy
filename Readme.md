@@ -2,6 +2,7 @@
 # deploy
 
   Minimalistic deployment shell script.
+  `my fork support rsync work with git`
 
 ## Installation
 
