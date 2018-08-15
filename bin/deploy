@@ -180,6 +180,7 @@ setup() {
   log running setup
   log cloning $repo
   git clone $repo $path/source
+  cd $path/source
   git submodule update --init --recursive
   test $? -eq 0 || abort failed to clone
   ln -sfn $path/source $path/current
@@ -243,10 +244,15 @@ deploy() {
   local shell="`ssh_command`"
   local port=`config_get port`
   local excludes=`config_get excludes`
-  local src=$path/source
+  local src=$path/source/
   local remote=`config_get user`@`config_get host`:`config_get path`
 
-  rsync -rltgoDzvO $src -e "ssh -p $port" --delete --progress --exclude ".git" $remote
+  rsync -rltgoDzvO $src -e "ssh -p $port" --delete --progress --exclude ".git" --exclude ".gitignore" --exclude "logs" $remote
+
+  if test $? -ne 0; then
+      log "rsync failed"
+      exit
+  fi
 
   # run hook
   hook post-deploy || abort post-deploy hook failed
